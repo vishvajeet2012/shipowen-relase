@@ -1,0 +1,129 @@
+# Builds the Shipown macOS installer on GitHub's Mac runners.
+#
+# This repository holds no source code. The workflow reads it from the private
+# repository vishvajeet2012/ops, at the commit you choose, through a read-only
+# deploy key (the OPS_DEPLOY_KEY secret), and builds exactly what
+# ops/.github/workflows/macos-installer.yml builds: one universal DMG, Intel and
+# Apple Silicon, macOS 11 Big Sur and later, checked on both kinds of Mac.
+#
+# It builds and checks, and stops there. It has no key to the download server
+# and publishes nothing: the DMG is kept as a workflow artifact for 7 days.
+# To publish it, download the artifact, unzip it, and in ops/push-ops run
+#
+#   node scripts/publish-installer.cjs --platform mac --from <unzipped folder>
+#
+# which checks the SHA-512 before anything reaches EC2. Then publish the release
+# from the admin panel.
+
+name: macOS installer
+
+on:
+  # By hand only. electron-builder skips code signing in pull-request builds,
+  # and an app without a signature does not open on Apple Silicon.
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit of vishvajeet2012/ops to build
+        required: true
+        default: main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-installer-${{ inputs.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and check on Apple Silicon
+    runs-on: macos-15
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: push-ops
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      commit: ${{ steps.version.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: vishvajeet2012/ops
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.OPS_DEPLOY_KEY }}
+          persist-credentials: false
+          sparse-checkout: push-ops
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: push-ops/package-lock.json
+
+      - name: Read the version and the commit
+        id: version
+        run: |
+          echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "Building ops@$(git rev-parse --short HEAD), Shipown $(node -p "require('./package.json').version")"
+
+      # Install scripts only compile native modules for this Node, which the
+      # Electron app cannot load; electron-builder downloads its own Electron.
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Add the Intel and Apple Silicon builds of native packages
+        run: node scripts/mac-universal-deps.cjs
+
+      - name: Compile
+        run: npm run build:ts
+
+      - name: Build the universal DMG
+        run: npx electron-builder --mac --universal --publish never --config electron-builder.yml
+
+      - name: Check latest-mac.yml names the DMG with its real SHA-512
+        run: node scripts/publish-installer.cjs --skip-build --dry-run
+
+      - name: Check the app and the DMG, and start them on Apple Silicon
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          bash scripts/verify-mac-build.sh build/mac-universal/Shipown.app
+          bash scripts/verify-mac-build.sh "build/Shipown-$VERSION.dmg"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: shipown-macos-${{ steps.version.outputs.version }}
+          path: |
+            push-ops/build/Shipown-${{ steps.version.outputs.version }}.dmg
+            push-ops/build/Shipown-${{ steps.version.outputs.version }}.dmg.blockmap
+            push-ops/build/latest-mac.yml
+          if-no-files-found: error
+          retention-days: 7
+
+  intel:
+    name: Start it on an Intel Mac
+    needs: build
+    # Real x86_64 hardware, as in the 2017-2020 Macs. GitHub retires its Intel
+    # runners in fall 2027; drop this job when the label goes.
+    runs-on: macos-15-intel
+    timeout-minutes: 20
+    steps:
+      # The same commit the build job built, not whatever the branch says now.
+      - uses: actions/checkout@v6
+        with:
+          repository: vishvajeet2012/ops
+          ref: ${{ needs.build.outputs.commit }}
+          ssh-key: ${{ secrets.OPS_DEPLOY_KEY }}
+          persist-credentials: false
+          sparse-checkout: push-ops/scripts
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: shipown-macos-${{ needs.build.outputs.version }}
+          path: artifact
+
+      - name: Check the DMG and start the app on Intel
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: bash push-ops/scripts/verify-mac-build.sh "artifact/Shipown-$VERSION.dmg"
