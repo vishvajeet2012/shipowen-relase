@@ -1,0 +1,46 @@
+# Builds every Shipown installer at once - Windows, Linux and macOS - from one
+# commit of vishvajeet2012/ops. Each platform runs its own workflow (and its own
+# checks); this one only starts them together, so a release is one click.
+#
+# Then, in ops/push-ops:
+#
+#   node scripts/publish-from-actions.cjs
+#
+# downloads this run's artifacts, checks each installer's SHA-512 against its
+# update manifest, and publishes them to EC2. Then publish the release from the
+# admin panel.
+
+name: All installers
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit of vishvajeet2012/ops to build
+        required: true
+        default: main
+
+# The platform workflows read the code and delete their own older artifacts;
+# a called workflow can have no more permission than this one gives it.
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  windows:
+    uses: ./.github/workflows/windows-installer.yml
+    with:
+      ref: ${{ inputs.ref }}
+    secrets: inherit
+
+  linux:
+    uses: ./.github/workflows/linux-installer.yml
+    with:
+      ref: ${{ inputs.ref }}
+    secrets: inherit
+
+  macos:
+    uses: ./.github/workflows/macos-installer.yml
+    with:
+      ref: ${{ inputs.ref }}
+    secrets: inherit

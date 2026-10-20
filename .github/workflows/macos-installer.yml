@@ -6,26 +6,30 @@
 # ops/.github/workflows/macos-installer.yml builds: one universal DMG, Intel and
 # Apple Silicon, macOS 11 Big Sur and later, checked on both kinds of Mac.
 #
-# It builds and checks, and stops there. It has no key to the download server
-# and publishes nothing: the DMG is kept as a workflow artifact for 7 days.
-# To publish it, download the artifact, unzip it, and in ops/push-ops run
-#
-#   node scripts/publish-installer.cjs --platform mac --from <unzipped folder>
-#
-# which checks the SHA-512 before anything reaches EC2. Then publish the release
-# from the admin panel.
+# It builds and checks, keeps the DMG as a workflow artifact for 7 days, and
+# then deletes the macOS artifacts of earlier runs, so only the newest build is
+# here. It has no key to the download server and publishes nothing: in
+# ops/push-ops, scripts/publish-from-actions.cjs downloads the artifact and
+# publishes it after checking its SHA-512. Then publish the release from the
+# admin panel.
 
 name: macOS installer
 
 on:
-  # By hand only. electron-builder skips code signing in pull-request builds,
-  # and an app without a signature does not open on Apple Silicon.
+  # By hand (or from All installers) only. electron-builder skips code signing
+  # in pull-request builds, and an app without a signature does not open on
+  # Apple Silicon.
   workflow_dispatch:
     inputs:
       ref:
         description: Branch, tag or commit of vishvajeet2012/ops to build
         required: true
         default: main
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        required: true
 
 permissions:
   contents: read
@@ -127,3 +131,23 @@ jobs:
         env:
           VERSION: ${{ needs.build.outputs.version }}
         run: bash push-ops/scripts/verify-mac-build.sh "artifact/Shipown-$VERSION.dmg"
+
+  prune:
+    name: Delete older macOS builds
+    # Only once this build has passed on both kinds of Mac.
+    needs: [build, intel]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Delete the macOS artifacts of earlier runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN: ${{ github.run_id }}
+        run: |
+          gh api "repos/$REPO/actions/artifacts?per_page=100" --paginate \
+            --jq ".artifacts[] | select(.name | startswith(\"shipown-macos-\")) | select(.workflow_run.id != $RUN) | .id" |
+          while read -r id; do
+            gh api -X DELETE "repos/$REPO/actions/artifacts/$id" && echo "deleted artifact $id"
+          done

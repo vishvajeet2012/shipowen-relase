@@ -1,0 +1,121 @@
+# Builds the Shipown Windows installer (Shipown-Setup-<version>.exe, x64) on
+# GitHub's Windows runners, from the private source repository
+# vishvajeet2012/ops at the commit you choose, read through a read-only deploy
+# key (the OPS_DEPLOY_KEY secret). This repository holds no source code.
+#
+# It builds, checks latest.yml, installs the installer silently and starts the
+# installed app, and keeps the result as a workflow artifact for 7 days. Then
+# it deletes the Windows artifacts of earlier runs, so only the newest build is
+# here. It has no key to the download server and publishes nothing: in
+# ops/push-ops, scripts/publish-from-actions.cjs downloads the artifact and
+# publishes it after checking its SHA-512.
+
+name: Windows installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit of vishvajeet2012/ops to build
+        required: true
+        default: main
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-installer-${{ inputs.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and check on Windows
+    runs-on: windows-2022
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+        working-directory: push-ops
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: vishvajeet2012/ops
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.OPS_DEPLOY_KEY }}
+          persist-credentials: false
+          sparse-checkout: push-ops
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: push-ops/package-lock.json
+
+      - name: Read the version and the commit
+        id: version
+        run: |
+          echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+          echo "Building ops@$(git rev-parse --short HEAD), Shipown $(node -p "require('./package.json').version")"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Compile
+        run: npm run build:ts
+
+      - name: Build the installer
+        run: npx electron-builder --win --publish never --config electron-builder.yml
+
+      - name: Check latest.yml names the installer with its real SHA-512
+        run: node scripts/publish-installer.cjs --skip-build --dry-run
+
+      # The installer itself, as a person runs it: per-user, silent, no admin.
+      - name: Install it
+        shell: pwsh
+        run: |
+          $setup = "build\Shipown-Setup-${{ steps.version.outputs.version }}.exe"
+          $p = Start-Process -FilePath $setup -ArgumentList '/S' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "The installer exited with $($p.ExitCode)" }
+          $exe = Get-ChildItem "$env:LOCALAPPDATA\Programs" -Recurse -Depth 2 -Filter 'Shipown.exe' | Select-Object -First 1
+          if (-not $exe) { throw 'Shipown.exe is not under %LOCALAPPDATA%\Programs after installing' }
+          "installed: $($exe.FullName)"
+          "SHIPOWN_EXE=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Start the installed app
+        run: node scripts/smoke-packaged.cjs "$SHIPOWN_EXE" x64
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: shipown-windows-${{ steps.version.outputs.version }}
+          path: |
+            push-ops/build/Shipown-Setup-${{ steps.version.outputs.version }}.exe
+            push-ops/build/Shipown-Setup-${{ steps.version.outputs.version }}.exe.blockmap
+            push-ops/build/latest.yml
+          if-no-files-found: error
+          retention-days: 7
+
+  prune:
+    name: Delete older Windows builds
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Delete the Windows artifacts of earlier runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN: ${{ github.run_id }}
+        run: |
+          gh api "repos/$REPO/actions/artifacts?per_page=100" --paginate \
+            --jq ".artifacts[] | select(.name | startswith(\"shipown-windows-\")) | select(.workflow_run.id != $RUN) | .id" |
+          while read -r id; do
+            gh api -X DELETE "repos/$REPO/actions/artifacts/$id" && echo "deleted artifact $id"
+          done

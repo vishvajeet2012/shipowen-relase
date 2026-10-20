@@ -1,0 +1,131 @@
+# Builds the Shipown Linux installer, the Debian package
+# (shipown-<version>-amd64.deb, for Debian and Ubuntu), on GitHub's Ubuntu
+# runners, from the private source repository vishvajeet2012/ops at the commit
+# you choose, read through a read-only deploy key (the OPS_DEPLOY_KEY secret).
+# This repository holds no source code.
+#
+# It builds, checks latest-linux.yml, installs the package with apt (which also
+# proves its dependencies resolve) and starts the installed app, and keeps the
+# result as a workflow artifact for 7 days. Then it deletes the Linux artifacts
+# of earlier runs, so only the newest build is here. It has no key to the
+# download server and publishes nothing: in ops/push-ops,
+# scripts/publish-from-actions.cjs downloads the artifact and publishes it after
+# checking its SHA-512.
+
+name: Linux installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit of vishvajeet2012/ops to build
+        required: true
+        default: main
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-installer-${{ inputs.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and check on Ubuntu
+    # The oldest Ubuntu still supported here: a package that installs and
+    # starts on 22.04 does on the newer ones too.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: push-ops
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: vishvajeet2012/ops
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.OPS_DEPLOY_KEY }}
+          persist-credentials: false
+          sparse-checkout: push-ops
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: push-ops/package-lock.json
+
+      - name: Read the version and the commit
+        id: version
+        run: |
+          echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+          echo "Building ops@$(git rev-parse --short HEAD), Shipown $(node -p "require('./package.json').version")"
+
+      # electron-builder needs fakeroot to produce a deb.
+      - name: Install the packaging tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq fakeroot libarchive-tools
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Compile
+        run: npm run build:ts
+
+      - name: Build the package
+        run: npx electron-builder --linux --publish never --config electron-builder.yml
+
+      - name: Check latest-linux.yml names the package with its real SHA-512
+        run: node scripts/publish-installer.cjs --skip-build --dry-run
+
+      # The package itself, as a person installs it. It keeps the name push-ops
+      # (package.json's name) so dpkg upgrades the installed copy.
+      - name: Install it
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          deb="build/shipown-$VERSION-amd64.deb"
+          dpkg-deb --info "$deb" | sed -n '/Package:/,/Description:/p'
+          sudo apt-get install -y -qq "./$deb"
+          exe=$(dpkg -L push-ops | while read -r f; do
+            case "$f" in /opt/*/push-ops|/opt/*/shipown|/opt/*/Shipown) [ -f "$f" ] && [ -x "$f" ] && echo "$f" ;; esac
+          done | head -1)
+          [ -n "$exe" ] || { echo "No executable under /opt after installing"; exit 1; }
+          echo "installed: $exe"
+          echo "SHIPOWN_EXE=$exe" >> "$GITHUB_ENV"
+
+      - name: Start the installed app
+        run: node scripts/smoke-packaged.cjs "$SHIPOWN_EXE" x64
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: shipown-linux-${{ steps.version.outputs.version }}
+          path: |
+            push-ops/build/shipown-${{ steps.version.outputs.version }}-amd64.deb
+            push-ops/build/latest-linux.yml
+          if-no-files-found: error
+          retention-days: 7
+
+  prune:
+    name: Delete older Linux builds
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Delete the Linux artifacts of earlier runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN: ${{ github.run_id }}
+        run: |
+          gh api "repos/$REPO/actions/artifacts?per_page=100" --paginate \
+            --jq ".artifacts[] | select(.name | startswith(\"shipown-linux-\")) | select(.workflow_run.id != $RUN) | .id" |
+          while read -r id; do
+            gh api -X DELETE "repos/$REPO/actions/artifacts/$id" && echo "deleted artifact $id"
+          done
