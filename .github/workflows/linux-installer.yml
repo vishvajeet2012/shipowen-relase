@@ -11,6 +11,12 @@
 # download server and publishes nothing: in ops/push-ops,
 # scripts/publish-from-actions.cjs downloads the artifact and publishes it after
 # checking its SHA-512.
+#
+# The same checked .deb is then repackaged as the Snap Store's snap
+# (push-ops/packaging/snap), installed with snapd and started on Ubuntu 22.04
+# and 24.04, and kept as the shipown-snap-<version> artifact. Nothing here has a
+# Snap Store login: the snap is uploaded by hand (snapcraft upload), and
+# publish-from-actions.cjs leaves it alone.
 
 name: Linux installer
 
@@ -111,21 +117,116 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  snap:
+    name: Snap, from the checked package
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: vishvajeet2012/ops
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.OPS_DEPLOY_KEY }}
+          persist-credentials: false
+          sparse-checkout: push-ops
+
+      - uses: actions/download-artifact@v6
+        with:
+          name: shipown-linux-${{ needs.build.outputs.version }}
+          path: deb
+
+      - name: Install snapcraft
+        run: sudo snap install snapcraft --classic
+
+      # core22 is Ubuntu 22.04, this runner, so it builds on the runner itself.
+      - name: Build the snap
+        working-directory: push-ops/packaging/snap
+        run: |
+          cp "$GITHUB_WORKSPACE/deb/shipown-$VERSION-amd64.deb" shipown.deb
+          sed -i "s/^version: .*/version: '$VERSION'/" snapcraft.yaml
+          sudo snapcraft pack --destructive-mode
+          ls -l shipown_*.snap
+          if unsquashfs -lls shipown_*.snap | grep -E '^-..s'; then echo "A setuid file is in the snap; the store refuses it"; exit 1; fi
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: shipown-snap-${{ needs.build.outputs.version }}
+          path: push-ops/packaging/snap/shipown_*.snap
+          if-no-files-found: error
+          retention-days: 7
+
+  snap-check:
+    name: Snap installs and starts on ${{ matrix.os }}
+    needs: [build, snap]
+    strategy:
+      fail-fast: false
+      matrix:
+        # 24.04 is where AppArmor may stop an unconfined app making the user
+        # namespace Electron's sandbox needs.
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: vishvajeet2012/ops
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.OPS_DEPLOY_KEY }}
+          persist-credentials: false
+          sparse-checkout: push-ops
+
+      - uses: actions/download-artifact@v6
+        with:
+          name: shipown-snap-${{ needs.build.outputs.version }}
+          path: snap
+
+      # A classic snap uses the desktop's own GTK and NSS, as the .deb does:
+      # the libraries its Depends name, which every Ubuntu desktop has.
+      - name: Install it as a person would
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 xdg-utils libatspi2.0-0 libuuid1 libsecret-1-0 >/dev/null
+          sudo snap install --dangerous --classic snap/shipown_*.snap
+          snap list shipown
+          echo "unprivileged user namespaces restricted by AppArmor: $(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo n/a)"
+
+      - name: Start the installed app's Node side
+        run: node push-ops/scripts/smoke-packaged.cjs /snap/shipown/current/opt/Shipown/push-ops x64
+
+      # The window itself, through the command a person runs: Electron's
+      # sandbox fails at once if it cannot start, so still running after 25s
+      # is the pass.
+      - name: Open its window
+        run: |
+          sudo apt-get install -y -qq xvfb >/dev/null
+          set +e
+          timeout 25 xvfb-run -a /snap/bin/shipown > run.log 2>&1
+          code=$?
+          set -e
+          tail -20 run.log
+          if [ "$code" != 124 ]; then echo "Shipown exited ($code) before 25s"; exit 1; fi
+          if grep -qi 'sandbox' run.log && grep -qi 'fatal' run.log; then echo "Electron's sandbox did not start"; exit 1; fi
+
   prune:
     name: Delete older Linux builds
-    needs: build
+    needs: [build, snap]
     runs-on: ubuntu-latest
     permissions:
       actions: write
     steps:
-      - name: Delete the Linux artifacts of earlier runs
+      - name: Delete the Linux and Snap artifacts of earlier runs
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           RUN: ${{ github.run_id }}
         run: |
           gh api "repos/$REPO/actions/artifacts?per_page=100" --paginate \
-            --jq ".artifacts[] | select(.name | startswith(\"shipown-linux-\")) | select(.workflow_run.id != $RUN) | .id" |
+            --jq ".artifacts[] | select((.name | startswith(\"shipown-linux-\")) or (.name | startswith(\"shipown-snap-\"))) | select(.workflow_run.id != $RUN) | .id" |
           while read -r id; do
             gh api -X DELETE "repos/$REPO/actions/artifacts/$id" && echo "deleted artifact $id"
           done
